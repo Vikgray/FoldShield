@@ -89,6 +89,7 @@ object EveAuthManager {
             .apply()
 
         val scopes = "esi-wallet.read_character_wallet.v1 esi-markets.read_character_orders.v1 esi-assets.read_assets.v1"
+
         val url = Uri.parse(AUTH_URL).buildUpon()
             .appendQueryParameter("response_type", "code")
             .appendQueryParameter("redirect_uri", REDIRECT_URI)
@@ -140,7 +141,7 @@ object EveAuthManager {
         }
 
         val refreshToken = p.getString("refresh_token", null)
-            ?: throw Exception("Сессия истекла. Войди через EVE SSO.")
+            ?: throw Exception("Сессия истекла, войдите заново")
         val clientId = getClientId(context)
 
         val body = "grant_type=refresh_token" +
@@ -149,99 +150,62 @@ object EveAuthManager {
 
         val tokenJson = postForm(TOKEN_URL, body)
         saveTokenResponse(context, tokenJson)
-        prefs(context).getString("access_token", null) ?: throw Exception("Не удалось обновить токен")
+        p.getString("access_token", "") ?: ""
     }
 
-    // Полная синхронизация: Кошелек + Ордера + Склад (Jita 4-4 и структуры Perimeter)
     suspend fun syncCharacterData(
         context: Context,
-        cachedSummaries: List<ItemOrderBookSummary> = emptyList()
+        marketSummaries: List<ItemOrderBookSummary>
     ): Result<EveSsoSyncResult> = withContext(Dispatchers.IO) {
         try {
             val token = getValidAccessToken(context)
             val charId = getCharacterId(context)
-            val charName = getCharacterName(context) ?: "Scotland Yard Solutions"
-            if (charId <= 0L) throw Exception("Некорректный ID персонажа")
-
-            val balance = EveApiClient.esi.getCharacterWallet(charId, "Bearer $token")
-            val orders = try {
-                EveApiClient.esi.getCharacterOrders(charId, "Bearer $token")
-            } catch (_: Exception) {
-                emptyList()
+            val charName = getCharacterName(context) ?: "Пилот"
+            if (charId <= 0L) {
+                return@withContext Result.failure(Exception("Character ID не найден"))
             }
+
+            val authHeader = "Bearer $token"
+            val balance = EveApiClient.esi.getCharacterWallet(charId, authHeader)
+            val orders = EveApiClient.esi.getCharacterOrders(charId, authHeader)
             val assets = try {
-                EveApiClient.esi.getCharacterAssets(charId, "Bearer $token", page = 1)
+                EveApiClient.esi.getCharacterAssets(charId, authHeader, 1)
             } catch (_: Exception) {
                 emptyList()
             }
 
-            // Исключаем PLEX (44992) из всех расчетов капитала и ордеров
-            val validOrders = orders.filter { it.typeId != EveApiClient.PLEX_TYPE_ID }
-            val buyOrders = validOrders.filter { it.isBuyOrder == true }
-            val sellOrders = validOrders.filter { it.isBuyOrder != true }
-
-            val totalEscrow = buyOrders.sumOf { it.escrow ?: (it.price * it.volumeRemain) }
+            val sellOrders = orders.filter { it.isBuyOrder != true }
+            val buyOrders = orders.filter { it.isBuyOrder == true }
             val totalSellVal = sellOrders.sumOf { it.price * it.volumeRemain }
+            val totalEscrow = buyOrders.sumOf { it.escrow ?: (it.price * it.volumeRemain) }
 
-            val catalogMap = EveApiClient.catalog.associateBy { it.typeId }
-            val priceMap = cachedSummaries.associate { it.item.typeId to it.bestSell }
+            val priceMap = marketSummaries.associate { it.item.typeId to it.bestSell }
+            val nameMap = EveApiClient.catalog.associate { it.typeId to it.name }
 
-            // Фильтруем предметы в ангаре Jita 4-4 и на структурах (Perimeter), исключая PLEX
-            val hangarAssets = assets.filter {
-                it.typeId != EveApiClient.PLEX_TYPE_ID && it.locationFlag == "Hangar"
+            val jitaHangarAssets = assets.filter {
+                it.locationId == EveApiClient.JITA_4_4 && priceMap.containsKey(it.typeId)
+            }
+            val totalHangarVal = jitaHangarAssets.sumOf { asset ->
+                (priceMap[asset.typeId] ?: 0.0) * asset.quantity
             }
 
-            var totalHangarVal = 0.0
-            val jitaHangarLines = mutableListOf<String>()
-            val perimeterTransferLines = mutableListOf<String>()
+            val totalNetWorth = (balance + totalSellVal + totalEscrow + totalHangarVal).toLong()
             val df = DecimalFormat("#,###", java.text.DecimalFormatSymbols.getInstance(Locale.US))
 
-            hangarAssets.groupBy { it.typeId to it.locationId }.forEach { (pair, list) ->
-                val (typeId, locId) = pair
-                val qty = list.sumOf { it.quantity }
-                val watched = catalogMap[typeId]
-                val customCost = EveApiClient.getCustomCostBasis(context, typeId, watched?.myCostBasis)
-                val unitVal = priceMap[typeId]?.takeIf { it > 0 } ?: customCost ?: 0.0
-                val stackVal = unitVal * qty
-
-                if (watched != null || stackVal >= 5_000_000.0) {
-                    totalHangarVal += stackVal
-                    val name = watched?.name ?: "typeId:$typeId"
-                    val valStr = if (unitVal > 0) " (~${df.format(stackVal)} ISK)" else ""
-                    if (locId == EveApiClient.JITA_4_4) {
-                        jitaHangarLines.add("  • [Jita 4-4] $name x$qty$valStr")
-                    } else if (locId > 1_000_000_000_000L) {
-                        perimeterTransferLines.add("  ⚠️ [ВЫВЕЗТИ ИЗ СТРУКТУРЫ В JITA] $name x$qty$valStr")
-                    }
-                }
-            }
-
-            val totalNetWorth = (balance + totalEscrow + totalSellVal + totalHangarVal).toLong()
-
             val sb = StringBuilder()
-            sb.appendLine("=== ПОРТФЕЛЬ EVE SSO ($charName, без учета PLEX) ===")
-            sb.appendLine("• Свободный кэш (Liquid ISK): ${df.format(balance)} ISK")
-            sb.appendLine("• В ордерах на покупку (Escrow): ${df.format(totalEscrow)} ISK (${buyOrders.size} орд.)")
-            sb.appendLine("• В ордерах на продажу (Sell Orders): ${df.format(totalSellVal)} ISK (${sellOrders.size} орд.)")
-            sb.appendLine("• На складе (Hangar): ${df.format(totalHangarVal)} ISK")
-            sb.appendLine("• ОБЩИЙ РАБОЧИЙ КАПИТАЛ (Net Worth): ${df.format(totalNetWorth)} ISK")
+            sb.appendLine("Пилот: $charName (ID: $charId)")
+            sb.appendLine("Баланс кошелька: ${df.format(balance.toLong())} ISK")
+            sb.appendLine("В ордерах на продажу (Sell): ${df.format(totalSellVal.toLong())} ISK (${sellOrders.size} шт)")
+            sb.appendLine("В залоге на покупку (Escrow): ${df.format(totalEscrow.toLong())} ISK (${buyOrders.size} шт)")
+            sb.appendLine("На складе Jita 4-4 (из каталога): ${df.format(totalHangarVal.toLong())} ISK")
+            sb.appendLine("ИТОГО КАПИТАЛ (Net Worth): ${df.format(totalNetWorth)} ISK")
 
-            if (perimeterTransferLines.isNotEmpty()) {
-                sb.appendLine("\n🚚 ВЫКУПЛЕНО В PERIMETER (Перевезти в Jita 4-4):")
-                perimeterTransferLines.forEach { sb.appendLine(it) }
-            }
-
-            if (jitaHangarLines.isNotEmpty()) {
-                sb.appendLine("\n📦 СКЛАД JITA 4-4 (Не выставлено в стакан):")
-                jitaHangarLines.forEach { sb.appendLine(it) }
-            }
-
-            if (validOrders.isNotEmpty()) {
-                sb.appendLine("\n📊 АКТИВНЫЕ ОРДЕРА ПЕРСОНАЖА:")
-                validOrders.sortedByDescending { it.price * it.volumeRemain }.take(35).forEach { o ->
-                    val side = if (o.isBuyOrder == true) "BUY " else "SELL"
-                    val itemName = catalogMap[o.typeId]?.name ?: "typeId:${o.typeId}"
-                    val topMarket = cachedSummaries.find { it.item.typeId == o.typeId }
+            if (orders.isNotEmpty()) {
+                sb.appendLine("\nАктивные ордера персонажа:")
+                orders.take(25).forEach { o ->
+                    val itemName = nameMap[o.typeId] ?: "typeId:${o.typeId}"
+                    val side = if (o.isBuyOrder == true) "BUY" else "SELL"
+                    val topMarket = marketSummaries.find { it.item.typeId == o.typeId }
                     val outbidTag = when {
                         topMarket == null -> ""
                         o.isBuyOrder == true && topMarket.bestBuy > o.price + 1.0 -> " [ПЕРЕБИТ! Топ: ${df.format(topMarket.bestBuy)}]"
@@ -292,7 +256,7 @@ object EveAuthManager {
         return JSONObject(respText)
     }
 
-        private fun saveTokenResponse(context: Context, json: JSONObject) {
+    private fun saveTokenResponse(context: Context, json: JSONObject) {
         val accessToken = json.getString("access_token")
         val oldRefreshToken = prefs(context).getString("refresh_token", "").orEmpty()
         val refreshToken = json.optString("refresh_token", oldRefreshToken).ifBlank { oldRefreshToken }
@@ -301,6 +265,7 @@ object EveAuthManager {
 
         var charId = getCharacterId(context)
         var charName = getCharacterName(context) ?: "Pilot"
+
         try {
             val parts = accessToken.split(".")
             if (parts.size >= 2) {

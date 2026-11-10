@@ -39,15 +39,12 @@ object TradePlanManager {
             return actions
         }
 
-        // Выделяем не более 15% свободного капитала на 1 позицию (защита от заморозки банка)
         val maxAllocationPerItem = if (capitalIsk > 0) capitalIsk * 0.15 else 3_000_000_000.0
 
         profitable.take(3).forEach { s ->
             val maxByCapital = max(1, (maxAllocationPerItem / (s.bestBuy * 1.005)).toInt())
-            // Берем не более 25% суточного оборота региона (чтобы партия уходила за 1 день)
             val maxByDailyVol = max(1, (s.avgDailyVolume7d * 0.25).toInt())
             val recommendedQty = min(maxByCapital, min(maxByDailyVol, 25))
-
             val profitTotal = s.netProfitPerUnit * recommendedQty
             val roiFmt = String.format(Locale.US, "%.1f", s.netRoiPercent)
 

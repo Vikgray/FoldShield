@@ -96,7 +96,8 @@ data class ItemOrderBookSummary(
     val bestSell: Double,
     val bestBuy: Double,
     val netProfitPerUnit: Double,
-    val netRoiPercent: Double
+    val netRoiPercent: Double,
+    val history30d: List<EsiHistoryEntry>? = emptyList()
 ) {
     val firstWallVolume: Int
         get() = topSellsJita.firstOrNull()?.second ?: 0
@@ -149,26 +150,26 @@ interface EveEsiApi {
 
 object EveApiClient {
     private const val ESI_BASE_URL = "https://esi.evetech.net/latest/"
-    const val PLEX_TYPE_ID = 44992
-    private const val PLEX_REGION_ID = 19000001
     const val JITA_4_4 = 60003760L
+    const val PLEX_REGION_ID = 19000001
 
     const val BUY_COST_MULT = 1.005
-    const val SELL_NET_MULT = 1.0 - 0.048358
+    const val SELL_NET_MULT = 0.95165
     const val RELIST_FEE_RATE = 0.00292
 
-    private val requestSemaphore = Semaphore(12)
+    private val requestSemaphore = Semaphore(8)
     private val resolveMutex = Mutex()
-    @Volatile private var resolvedIdsByName: Map<String, Int> = emptyMap()
+    @Volatile
+    private var resolvedIdsByName: Map<String, Int> = emptyMap()
 
     val catalog: List<WatchedItem> = listOf(
-        // 1. АКТИВНЫЕ ПОЗИЦИИ
+        // 1. АКТИВНЫЕ ТОРГИ
         WatchedItem(20509, "High-grade Amulet Omega", TradeCategory.ACTIVE, 1269315000.0),
-        WatchedItem(53714, "High-grade Nirvana Omega", TradeCategory.ACTIVE),
-        WatchedItem(42215, "High-grade Asklepian Omega", TradeCategory.ACTIVE, 1120575000.0),
-        WatchedItem(47027, "High-grade Mimesis Omega", TradeCategory.ACTIVE, 579684000.0),
-        WatchedItem(19021, "Corpum A-Type Medium Armor Repairer", TradeCategory.ACTIVE, 262305000.0),
-        WatchedItem(19187, "Pithum C-Type Medium Shield Booster", TradeCategory.ACTIVE, 77226210.0),
+        WatchedItem(53714, "High-grade Nirvana Omega", TradeCategory.ACTIVE, 1554735000.0),
+        WatchedItem(42215, "High-grade Asklepian Omega", TradeCategory.ACTIVE, 1126605000.0),
+        WatchedItem(47027, "High-grade Mimesis Omega", TradeCategory.ACTIVE, 578880000.0),
+        WatchedItem(19187, "Pithum C-Type Medium Shield Booster", TradeCategory.ACTIVE, 77385000.0),
+        WatchedItem(19021, "Corpum A-Type Medium Armor Repairer", TradeCategory.ACTIVE, 261300000.0),
         WatchedItem(19200, "Gist X-Type Large Shield Booster", TradeCategory.ACTIVE, 208537500.0),
         WatchedItem(19015, "Coreli A-Type Small Armor Repairer", TradeCategory.ACTIVE, 27104850.0),
         WatchedItem(19031, "Corelum C-Type Medium Armor Repairer", TradeCategory.ACTIVE, 51445950.0),
@@ -279,7 +280,7 @@ object EveApiClient {
         OkHttpClient.Builder()
             .addInterceptor { chain ->
                 val req = chain.request().newBuilder()
-                    .header("User-Agent", "FoldShield/1.0 (Android; EVE Trader)")
+                    .header("User-Agent", "FoldShield/2.0 (Android; EVE Trader)")
                     .build()
                 chain.proceed(req)
             }
@@ -332,6 +333,7 @@ object EveApiClient {
     suspend fun fetchCategorySnapshot(context: Context, category: TradeCategory): List<ItemOrderBookSummary> = coroutineScope {
         ensureCatalogIdsResolved()
         val targetList = if (category == TradeCategory.ALL) catalog else catalog.filter { it.category == category }
+
         targetList.map { rawItem ->
             async {
                 requestSemaphore.withPermit {
@@ -344,7 +346,6 @@ object EveApiClient {
                         val history = try { esi.getHistory(regionId = item.regionId, typeId = item.typeId) } catch (_: Exception) { emptyList() }
 
                         val isPlex = item.regionId == PLEX_REGION_ID
-
                         val sellsAll = orders.filter { !it.isBuyOrder && it.price > 100_000.0 }
                         val buysAll  = orders.filter { it.isBuyOrder  && it.price > 100_000.0 }
 
@@ -358,6 +359,7 @@ object EveApiClient {
                             .take(5)
 
                         val bestSell = sells.firstOrNull()?.first ?: 0.0
+
                         val filteredBuys = buysAll.filter {
                             if (bestSell > 10_000_000.0) it.price >= (bestSell * 0.15) else true
                         }
@@ -373,7 +375,6 @@ object EveApiClient {
                         val buyCostWithScc = bestBuy * BUY_COST_MULT
                         val sellNetAfterTaxes = bestSell * SELL_NET_MULT
                         val netProfit = if (bestSell > 0 && bestBuy > 0) sellNetAfterTaxes - buyCostWithScc else 0.0
-
                         val rawRoi = if (buyCostWithScc > 0 && bestSell > 0) (netProfit / buyCostWithScc) * 100.0 else 0.0
                         val netRoi = if (rawRoi > 500.0 || rawRoi < -100.0) 0.0 else rawRoi
 
@@ -389,7 +390,8 @@ object EveApiClient {
                             bestSell = bestSell,
                             bestBuy = bestBuy,
                             netProfitPerUnit = netProfit,
-                            netRoiPercent = netRoi
+                            netRoiPercent = netRoi,
+                            history30d = history.takeLast(30)
                         )
                     } catch (_: Exception) {
                         null
@@ -421,7 +423,10 @@ object EveApiClient {
             val list: List<ItemOrderBookSummary> = Gson().fromJson(json, type)
             list.map { s ->
                 val updatedCost = getCustomCostBasis(context, s.item.typeId, s.item.myCostBasis)
-                s.copy(item = s.item.copy(myCostBasis = updatedCost))
+                s.copy(
+                    item = s.item.copy(myCostBasis = updatedCost),
+                    history30d = s.history30d ?: emptyList()
+                )
             }
         } catch (_: Exception) {
             emptyList()
@@ -437,10 +442,12 @@ object EveApiClient {
         val sb = StringBuilder()
         sb.appendLine("=== EVE TRADING REPORT (FOLDSHIELD -> AI) ===")
         sb.appendLine("Учет филаментов на альте (по себестоимости, без учета прибыли альта): ${df.format(altFilamentDebtIsk)} ISK")
+
         if (!ssoSummaryText.isNullOrBlank()) {
             sb.appendLine("\n--- ДАННЫЕ ПЕРСОНАЖА (EVE SSO) ---")
             sb.appendLine(ssoSummaryText.trim())
         }
+
         sb.appendLine("\n--- ЖИВЫЕ СТАКАНЫ ESI (${summaries.size} поз.) ---")
         for (s in summaries) {
             val roiStr = String.format(Locale.US, "%.2f", s.netRoiPercent)
